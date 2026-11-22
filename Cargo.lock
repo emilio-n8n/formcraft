@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "formcraft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "craftkit-core",
  "craftkit-io",

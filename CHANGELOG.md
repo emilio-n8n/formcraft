@@ -2,7 +2,7 @@
 
 All notable changes to FormCraft are documented here.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-22
 
 ### Added (productisation slice, planned v0.2.0)
 
