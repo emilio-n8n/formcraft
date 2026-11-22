@@ -51,3 +51,58 @@ must not drop a table.
 
 Consequences: data-editing statements return a clear error instead of running.
 Table browsing uses `SELECT *` from table names quoted as SQL identifiers.
+
+## ADR-004 — Controlled writes with a session undo stack
+
+Date: 2026-11-22
+
+Decision: free-form SQL remains read-only. Data writes go through explicit
+transactional helpers (`update_cell`, `insert_record`, `update_record`,
+`delete_row`). Each user action records a `DataEdit` with its inverse in a
+bounded, session-only undo/redo stack; CraftKit history still owns document
+fields such as the title, last query and query history.
+
+Alternatives: allow `UPDATE`/`DELETE` in the query box; put inverse SQL in the
+persisted document.
+
+Reasons: a browsing tool must not destroy data accidentally, and database
+connections cannot live in `DocumentHost<T>` snapshots. A row `rowid` is a
+stable edit key for SQLite tables created by the application.
+
+Consequences: destructive actions (row and table deletion) ask for
+confirmation. Undo of a deleted row re-inserts it with a new `rowid`; schema
+changes are not part of the undo stack and are always confirmed.
+
+## ADR-005 — Schema v2 and persisted query history
+
+Date: 2026-11-22
+
+Decision: `Document` gains `query_history: Vec<String>` with `#[serde(default)]`
+and the project schema version is bumped from 1 to 2.
+
+Alternatives: keep query history in memory only; silently reuse schema v1.
+
+Reasons: a productised browser should remember recent queries across restarts.
+The serde default makes v1 files load unchanged, and CraftKit rejects newer
+schemas rather than misreading them.
+
+Consequences: saved projects are written as `schema_version: 2`; older files
+are migrated in memory on load. A migration test checks v1 compatibility.
+
+## ADR-006 — CSV import and generated forms
+
+Date: 2026-11-22
+
+Decision: CSV import parses headers and values with the `csv` crate, matches
+headers case-insensitively to table columns, coerces text to the declared
+column type and inserts everything in one transaction. The form view is
+generated from `PRAGMA table_info` rather than stored in the project.
+
+Alternatives: hand-rolled CSV parsing; a fixed hardcoded form per table.
+
+Reasons: malformed CSV and type errors must be reported to the user without
+leaving a partially imported table; generated forms stay correct after schema
+changes.
+
+Consequences: BLOB columns are imported as text in this slice, and form fields
+for typed columns are validated before being written.

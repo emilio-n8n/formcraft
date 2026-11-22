@@ -12,8 +12,17 @@ desktop foundation.
 ## Features
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
-- Open a SQLite file and browse its tables in a grid.
-- Read-only SQL query box with a Run button and inline error display.
+- Open a SQLite file and browse its tables in an editable grid.
+- Double-click a cell to edit it; add or delete rows with confirmation for
+  destructive operations. Each data edit is recorded in a session undo stack.
+- Schema editor: create tables with typed columns, add a column, drop a table
+  with confirmation, and inspect the current table schema.
+- Generated form view for creating and updating a record.
+- CSV import into an existing table (headers matched case-insensitively,
+  values checked against declared types, single SQLite transaction).
+- Read-only SQL query box with a Run button, inline error display and a bounded
+  query history persisted in the project file.
+- Text filter, row limit and refresh for large tables.
 - CSV export of the currently displayed rows.
 - `--sample` starts with an in-memory `people` database filled with demo rows.
 - Versioned JSON project files with atomic saves.
@@ -22,7 +31,8 @@ desktop foundation.
 - Offline-first: no account, no telemetry, no network required.
 
 FormCraft does not read Microsoft Access `.accdb` files. Only SQLite is
-supported in this slice.
+supported. Free-form SQL stays read-only; all writes go through the controlled,
+transactional UI actions.
 
 ## Run
 
@@ -67,14 +77,15 @@ Projects are JSON envelopes:
 ```json
 {
   "format": "formcraft",
-  "schema_version": 1,
+  "schema_version": 2,
   "app_version": "0.1.0",
   "document": { }
 }
 ```
 
-The application owns the `document` schema and its migrations. A newer
-`schema_version` is rejected instead of being silently misread.
+The application owns the `document` schema and its migrations. Schema v2 adds
+`query_history`; v1 projects omit it and are read with an empty history. A
+newer `schema_version` is rejected instead of being silently misread.
 
 ## Licence
 
