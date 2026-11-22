@@ -1,8 +1,9 @@
-//! CraftKit reference application entry point.
+//! FormCraft entry point: CLI parsing and eframe startup.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod database;
 mod document;
 
 use craftkit_ui::cli::{self, CliAction};
@@ -21,10 +22,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
         CliAction::Help => {
             print!(
                 "{}",
-                cli::help_text(
-                    "formcraft",
-                    "CraftKit demo — notes application and reference implementation"
-                )
+                cli::help_text("formcraft", "FormCraft — SQLite database browser")
             );
             return Ok(());
         }
@@ -36,7 +34,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
     };
 
     run_native(WindowOptions::new("FormCraft"), move |context| {
-        let app = app::DemoApp::new(context, options);
+        let app = app::FormCraftApp::new(context, options);
         Ok(Box::new(app) as Box<dyn craftkit_ui::eframe::App>)
     })
 }

@@ -12,11 +12,17 @@ desktop foundation.
 ## Features
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
+- Open a SQLite file and browse its tables in a grid.
+- Read-only SQL query box with a Run button and inline error display.
+- CSV export of the currently displayed rows.
+- `--sample` starts with an in-memory `people` database filled with demo rows.
 - Versioned JSON project files with atomic saves.
 - Bounded undo/redo through the shared document history.
-- Background jobs with progress and cooperative cancellation.
 - Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
+
+FormCraft does not read Microsoft Access `.accdb` files. Only SQLite is
+supported in this slice.
 
 ## Run
 

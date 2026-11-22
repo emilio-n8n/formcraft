@@ -3,6 +3,7 @@
 FormCraft is built on CraftKit and the Rust crates listed in `Cargo.lock`.
 
 - CraftKit: MIT OR Apache-2.0, <https://github.com/emilio-n8n/craftkit>
+- rusqlite / libsqlite3-sys: MIT OR Apache-2.0 (SQLite is public domain)
 - egui / eframe: MIT OR Apache-2.0
 - serde / serde_json: MIT OR Apache-2.0
 - rfd: MIT
