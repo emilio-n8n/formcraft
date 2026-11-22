@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "formcraft",
+  "name": "FormCraft",
+  "tagline": "SQLite database browser and form builder",
+  "repo": "emilio-n8n/formcraft",
+  "publisher": "emilio-n8n",
+  "upstream": null,
+  "bundle_id": "io.github.emilion8n.formcraft",
+  "msi_publisher": "emilio-n8n",
+  "apple_team": null,
+  "website": "https://github.com/emilio-n8n/formcraft",
+  "color": "#39b982",
+  "icon": "formcraft-128.png"
+}
