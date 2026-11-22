@@ -56,7 +56,7 @@ Each release should attach:
 
 - archives named `<id>-<version>-<os>-<arch>.<ext>`:
   - `formcraft-<version>-linux-x86_64.tar.gz` or `.AppImage` / `.deb` / `.rpm`
-  - `formcraft-<version>-windows-x64.zip` or `.msi`
+  - `formcraft-<version>-windows-x64-portable.zip` or `.msi`
   - `formcraft-<version>-macos-aarch64.dmg` / `macos-x86_64.dmg`
 - `craft-app.json`
 - `formcraft-128.png`
