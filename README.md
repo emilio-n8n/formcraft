@@ -12,15 +12,19 @@ desktop foundation.
 ## Features
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
-- Open a SQLite file and browse its tables in an editable grid.
+- Open a SQLite file and browse its tables in an editable grid. Tables without
+  an accessible `rowid`, including `WITHOUT ROWID` tables, remain browsable in
+  read-only mode.
 - Double-click a cell to edit it; add or delete rows with confirmation for
-  destructive operations. Each data edit is recorded in a session undo stack.
+  destructive operations. Data undo/redo is atomic and bounded to 100 edits.
 - Schema editor: create tables with typed columns, add a column, drop a table
   with confirmation, and inspect the current table schema.
-- Generated form view for creating and updating a record.
-- CSV import into an existing table (headers matched case-insensitively,
-  values checked against declared types, single SQLite transaction).
-- Read-only SQL query box with a Run button, inline error display and a bounded
+- Generated form view for creating and updating a record, with required-field,
+  integer and finite-number validation before any write.
+- CSV import into an existing table (case-insensitive headers, UTF-8 BOM
+  support, duplicate-header rejection, typed values and transactional rollback).
+- Read-only SQL query box enforced by SQLite `query_only` mode, including
+  writable `WITH` statements and PRAGMAs, with inline errors and a bounded
   query history persisted in the project file.
 - Text filter, row limit and refresh for large tables.
 - CSV export of the currently displayed rows.
@@ -52,8 +56,8 @@ Without arguments the application opens an empty document.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
 Linux windowing development packages are installed by the CI workflow.

@@ -9,13 +9,14 @@ use craftkit_ui::egui::{Align, Layout, RichText};
 use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 use rusqlite::Connection;
 
-use crate::database::{self, ColumnInfo, DataEdit, SqlType, TableRows};
+use crate::database::{self, ColumnInfo, DataEdit, FormField, FormFieldError, SqlType, TableRows};
 use crate::document::Document;
 
 const FORMAT: &str = "formcraft";
 const SCHEMA_VERSION: u32 = 2;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_VISIBLE_ROWS: u32 = 200;
+const MAX_DATA_HISTORY: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -73,14 +74,15 @@ struct SchemaDialog {
 
 #[derive(Debug, Clone)]
 enum Confirmation {
-    DeleteRow { row_id: i64 },
+    DeleteRow { table: String, row_id: i64 },
     DropTable { table: String },
 }
 
 #[derive(Debug, Clone)]
 struct CellEdit {
-    row: usize,
-    column: usize,
+    row_id: i64,
+    column: String,
+    before: Option<String>,
     text: String,
 }
 
@@ -90,6 +92,8 @@ struct FormState {
     values: Vec<String>,
     original: Vec<Option<String>>,
     row_id: Option<i64>,
+    editable: bool,
+    errors: Vec<FormFieldError>,
 }
 
 impl FormState {
@@ -100,7 +104,22 @@ impl FormState {
             values: vec![String::new(); width],
             original: vec![None; width],
             row_id: None,
+            editable: true,
+            errors: Vec::new(),
         }
+    }
+
+    fn fields(&self) -> Vec<FormField> {
+        let values = self
+            .values
+            .iter()
+            .map(|value| (!value.trim().is_empty()).then_some(value.clone()))
+            .collect::<Vec<_>>();
+        database::build_form_fields(&self.columns, Some(&values))
+    }
+
+    fn clear_error(&mut self, index: usize) {
+        self.errors.retain(|error| error.index != index);
     }
 
     fn is_empty(&self) -> bool {
@@ -124,7 +143,8 @@ struct CentralActions {
     edit_row: Option<i64>,
     save_form: bool,
     new_form: bool,
-    start_edit: Option<(usize, usize, String)>,
+    form_changed: Vec<usize>,
+    start_edit: Option<(i64, String, Option<String>, String)>,
     commit_edit: bool,
     cancel_edit: bool,
     choose_query: Option<String>,
@@ -217,6 +237,30 @@ impl FormCraftApp {
         self.shell.notify(Tone::Error, title, message);
     }
 
+    fn clear_session(&mut self) {
+        self.session = None;
+        self.tables.clear();
+        self.selected_table = None;
+        self.table_rows = TableRows::default();
+        self.form = FormState::empty(Vec::new());
+        self.view = View::Grid;
+        self.search.clear();
+        self.editing = None;
+        self.schema_dialog = None;
+        self.confirmation = None;
+        self.show_schema = false;
+        self.undo_edits.clear();
+        self.redo_edits.clear();
+    }
+
+    fn record_data_edit(&mut self, edit: DataEdit) {
+        if self.undo_edits.len() >= MAX_DATA_HISTORY {
+            self.undo_edits.remove(0);
+        }
+        self.undo_edits.push(edit);
+        self.redo_edits.clear();
+    }
+
     /// Install a new live session, checking the first table before replacing
     /// any existing state so a failed open leaves the previous data usable.
     fn install_session(&mut self, connection: Connection) -> Result<(), String> {
@@ -231,6 +275,9 @@ impl FormCraftApp {
         self.undo_edits.clear();
         self.redo_edits.clear();
         self.editing = None;
+        self.schema_dialog = None;
+        self.confirmation = None;
+        self.show_schema = false;
         self.search.clear();
         self.refresh_rows();
         self.refresh_form();
@@ -246,9 +293,7 @@ impl FormCraftApp {
         match DocumentHost::from_file(path.clone(), FORMAT, SCHEMA_VERSION, APP_VERSION) {
             Ok(host) => {
                 self.host = host;
-                self.editing = None;
-                self.undo_edits.clear();
-                self.redo_edits.clear();
+                self.clear_session();
                 self.error = None;
                 let database_path = self.host.document().database_path.clone();
                 if let Some(database_path) = database_path
@@ -268,15 +313,7 @@ impl FormCraftApp {
 
     fn new_document(&mut self) {
         self.host.reset(Document::default());
-        self.session = None;
-        self.tables.clear();
-        self.selected_table = None;
-        self.table_rows = TableRows::default();
-        self.form = FormState::empty(Vec::new());
-        self.editing = None;
-        self.search.clear();
-        self.undo_edits.clear();
-        self.redo_edits.clear();
+        self.clear_session();
         self.error = None;
         self.shell.set_status("New document");
     }
@@ -426,6 +463,7 @@ impl FormCraftApp {
     }
 
     fn refresh_rows(&mut self) {
+        self.editing = None;
         let outcome = match (self.session.as_ref(), self.selected_table.as_deref()) {
             (Some(connection), Some(table)) => {
                 database::table_rows(connection, table, Some(&self.search), self.limit)
@@ -448,19 +486,23 @@ impl FormCraftApp {
     }
 
     fn refresh_form(&mut self) {
-        let columns = match (self.session.as_ref(), self.selected_table.as_deref()) {
+        let (columns, editable) = match (self.session.as_ref(), self.selected_table.as_deref()) {
             (Some(connection), Some(table)) => match database::table_schema(connection, table) {
-                Ok(columns) => columns,
+                Ok(columns) => (
+                    columns,
+                    database::table_has_rowid(connection, table).unwrap_or(false),
+                ),
                 Err(error) => {
                     self.error = Some(error.to_string());
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             },
-            _ => Vec::new(),
+            _ => (Vec::new(), false),
         };
         let fields = database::build_form_fields(&columns, None);
         let mut state = FormState::empty(columns);
         state.values = fields.iter().map(|field| field.value.clone()).collect();
+        state.editable = editable;
         self.form = state;
     }
 
@@ -477,6 +519,7 @@ impl FormCraftApp {
 
     fn run_query(&mut self) {
         self.finish_gesture();
+        self.editing = None;
         let sql = self.host.document().last_query.clone();
         let outcome = match (self.session.as_ref(), sql.trim().is_empty()) {
             (Some(connection), false) => database::run_query(connection, &sql),
@@ -501,6 +544,7 @@ impl FormCraftApp {
                 self.table_rows = TableRows {
                     result,
                     row_ids: Vec::new(),
+                    editable: false,
                 };
                 self.error = None;
                 self.host.apply(|document| document.remember_query(&sql));
@@ -523,40 +567,39 @@ impl FormCraftApp {
         let Some(edit) = self.editing.take() else {
             return;
         };
+        if !self.table_rows.editable {
+            return;
+        }
         let Some(table) = self.selected_table.clone() else {
             return;
         };
-        let Some(row_id) = self.table_rows.row_ids.get(edit.row).copied() else {
-            return;
-        };
-        let Some(column) = self.table_rows.result.columns.get(edit.column).cloned() else {
-            return;
-        };
-        let before = self
-            .table_rows
-            .result
-            .rows
-            .get(edit.row)
-            .and_then(|row| row.get(edit.column))
-            .cloned()
-            .flatten();
         let after = if edit.text.trim().is_empty() {
             None
         } else {
             Some(edit.text.trim().to_owned())
         };
-        let mut change = DataEdit::Cell {
-            table,
-            row_id,
-            column,
-            before,
-            after,
-        };
+        if edit.before == after {
+            self.refresh_rows();
+            return;
+        }
         if let Some(connection) = self.session.as_mut() {
-            match change.redo(connection) {
+            let result = database::update_cell(
+                connection,
+                &table,
+                edit.row_id,
+                &edit.column,
+                after.as_deref(),
+            );
+            match result {
                 Ok(()) => {
-                    self.undo_edits.push(change);
-                    self.redo_edits.clear();
+                    let change = DataEdit::Cell {
+                        table,
+                        row_id: edit.row_id,
+                        column: edit.column,
+                        before: edit.before,
+                        after,
+                    };
+                    self.record_data_edit(change);
                     self.refresh_rows();
                     self.refresh_form();
                     self.shell.set_status("Cell updated");
@@ -567,6 +610,9 @@ impl FormCraftApp {
     }
 
     fn add_row(&mut self) {
+        if !self.table_rows.editable {
+            return;
+        }
         let Some(table) = self.selected_table.clone() else {
             return;
         };
@@ -585,17 +631,17 @@ impl FormCraftApp {
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let values = vec![None; names.len()];
-        let mut change = DataEdit::Insert {
-            table,
-            columns: names,
-            values,
-            row_id: 0,
-        };
         if let Some(connection) = self.session.as_mut() {
-            match change.redo(connection) {
-                Ok(()) => {
-                    self.undo_edits.push(change);
-                    self.redo_edits.clear();
+            let result = database::insert_record(connection, &table, &names, &values);
+            match result {
+                Ok(row_id) => {
+                    let change = DataEdit::Insert {
+                        table,
+                        columns: names,
+                        values,
+                        row_id,
+                    };
+                    self.record_data_edit(change);
                     self.refresh_rows();
                     self.refresh_form();
                     self.shell.set_status("Row added");
@@ -606,7 +652,13 @@ impl FormCraftApp {
     }
 
     fn request_delete_row(&mut self, row_id: i64) {
-        self.confirmation = Some(Confirmation::DeleteRow { row_id });
+        if !self.table_rows.editable {
+            return;
+        }
+        let Some(table) = self.selected_table.clone() else {
+            return;
+        };
+        self.confirmation = Some(Confirmation::DeleteRow { table, row_id });
     }
 
     fn request_drop_table(&mut self, table: String) {
@@ -615,10 +667,7 @@ impl FormCraftApp {
 
     fn perform_confirmation(&mut self, confirmation: Confirmation) {
         match confirmation {
-            Confirmation::DeleteRow { row_id } => {
-                let Some(table) = self.selected_table.clone() else {
-                    return;
-                };
+            Confirmation::DeleteRow { table, row_id } => {
                 let details = self.session.as_ref().and_then(|connection| {
                     let columns = database::table_schema(connection, &table).ok()?;
                     let values = database::record_values(connection, &table, row_id).ok()??;
@@ -632,17 +681,17 @@ impl FormCraftApp {
                     .iter()
                     .map(|column| column.name.clone())
                     .collect::<Vec<_>>();
-                let mut change = DataEdit::Delete {
-                    table,
-                    columns: names,
-                    values,
-                    row_id,
-                };
                 if let Some(connection) = self.session.as_mut() {
-                    match change.redo(connection) {
+                    let result = database::delete_row(connection, &table, row_id);
+                    match result {
                         Ok(()) => {
-                            self.undo_edits.push(change);
-                            self.redo_edits.clear();
+                            let change = DataEdit::Delete {
+                                table,
+                                columns: names,
+                                values,
+                                row_id,
+                            };
+                            self.record_data_edit(change);
                             self.refresh_rows();
                             self.refresh_form();
                             self.shell.set_status("Row deleted");
@@ -733,6 +782,7 @@ impl FormCraftApp {
                 self.form.row_id = Some(row_id);
                 self.form.original = values;
                 self.form.values = fields.iter().map(|field| field.value.clone()).collect();
+                self.form.errors.clear();
                 self.view = View::Form;
                 self.shell.set_status(format!("Editing row {row_id}"));
             }
@@ -751,6 +801,22 @@ impl FormCraftApp {
                 .notify(Tone::Warning, "No fields", "Select a table first.");
             return;
         }
+        if !form.editable {
+            self.shell.notify(
+                Tone::Warning,
+                "Read-only table",
+                "This table has no accessible rowid, so records cannot be edited here.",
+            );
+            return;
+        }
+        let validation_errors = database::validate_form_fields(&form.fields());
+        if let Some(first) = validation_errors.first() {
+            let message = format!("{}: {}", first.column, first.message);
+            self.form.errors = validation_errors;
+            self.report_error("Invalid form", &message);
+            return;
+        }
+        self.form.errors.clear();
         let values = form
             .values
             .iter()
@@ -762,12 +828,6 @@ impl FormCraftApp {
                 }
             })
             .collect::<Vec<_>>();
-        for (column, value) in form.columns.iter().zip(&values) {
-            if let Err(error) = database::coerce_value(value.as_deref(), column.sql_type) {
-                self.report_error("Invalid value", &error.to_string());
-                return;
-            }
-        }
         match form.row_id {
             Some(row_id) => {
                 let mut edits = Vec::new();
@@ -792,8 +852,7 @@ impl FormCraftApp {
                 if let Some(connection) = self.session.as_mut() {
                     match database::update_record(connection, &table, row_id, &values) {
                         Ok(()) => {
-                            self.undo_edits.push(change);
-                            self.redo_edits.clear();
+                            self.record_data_edit(change);
                             self.refresh_rows();
                             self.form.original = values;
                             self.shell.set_status("Record saved");
@@ -819,9 +878,9 @@ impl FormCraftApp {
                 if let Some(connection) = self.session.as_mut() {
                     match change.redo(connection) {
                         Ok(()) => {
-                            self.undo_edits.push(change);
-                            self.redo_edits.clear();
+                            self.record_data_edit(change);
                             self.refresh_rows();
+                            self.refresh_form();
                             self.shell.set_status("Record created");
                         }
                         Err(error) => {
@@ -844,56 +903,64 @@ impl FormCraftApp {
         });
     }
 
-    fn apply_schema_dialog(&mut self, dialog: &SchemaDialog) {
+    fn apply_schema_dialog(&mut self, dialog: &SchemaDialog) -> bool {
+        let Some(connection) = self.session.as_ref() else {
+            self.shell.notify(
+                Tone::Warning,
+                "No database",
+                "Open a SQLite database first.",
+            );
+            return false;
+        };
         match dialog.kind {
             SchemaKind::CreateTable => {
                 let definitions = match database::parse_column_defs(&dialog.columns_text) {
                     Ok(definitions) => definitions,
                     Err(error) => {
                         self.report_error("Invalid columns", &error.to_string());
-                        return;
+                        return false;
                     }
                 };
                 let columns = definitions
                     .iter()
                     .map(|column| (column.name.clone(), column.sql_type))
                     .collect::<Vec<_>>();
-                if let Some(connection) = self.session.as_ref() {
-                    match database::create_table(connection, &dialog.table_name, &columns) {
-                        Ok(()) => {
-                            self.refresh_tables();
-                            self.selected_table = Some(dialog.table_name.clone());
-                            self.refresh_rows();
-                            self.refresh_form();
-                            self.shell
-                                .set_status(format!("Created table {}", dialog.table_name));
-                        }
-                        Err(error) => {
-                            self.report_error("Could not create table", &error.to_string())
-                        }
+                match database::create_table(connection, &dialog.table_name, &columns) {
+                    Ok(()) => {
+                        self.refresh_tables();
+                        self.selected_table = Some(dialog.table_name.clone());
+                        self.refresh_rows();
+                        self.refresh_form();
+                        self.shell
+                            .set_status(format!("Created table {}", dialog.table_name));
+                        true
+                    }
+                    Err(error) => {
+                        self.report_error("Could not create table", &error.to_string());
+                        false
                     }
                 }
             }
             SchemaKind::AddColumn => {
                 let Some(table) = self.selected_table.clone() else {
-                    return;
+                    return false;
                 };
-                if let Some(connection) = self.session.as_ref() {
-                    match database::add_column(
-                        connection,
-                        &table,
-                        &dialog.column_name,
-                        dialog.column_type,
-                    ) {
-                        Ok(()) => {
-                            self.refresh_rows();
-                            self.refresh_form();
-                            self.shell.set_status(format!(
-                                "Added column {} to {table}",
-                                dialog.column_name
-                            ));
-                        }
-                        Err(error) => self.report_error("Could not add column", &error.to_string()),
+                match database::add_column(
+                    connection,
+                    &table,
+                    &dialog.column_name,
+                    dialog.column_type,
+                ) {
+                    Ok(()) => {
+                        self.refresh_rows();
+                        self.refresh_form();
+                        self.shell
+                            .set_status(format!("Added column {} to {table}", dialog.column_name));
+                        true
+                    }
+                    Err(error) => {
+                        self.report_error("Could not add column", &error.to_string());
+                        false
                     }
                 }
             }
@@ -1133,46 +1200,55 @@ impl FormCraftApp {
             .default_size(230.0)
             .min_size(170.0)
             .show(ui, |ui| {
-                widgets::section_label(ui, "Tables");
-                ui.add_space(4.0);
-                if self.session.is_none() {
-                    widgets::empty_state(
-                        ui,
-                        "No database open",
-                        "Use File > Open database... or launch with --sample.",
-                    );
-                } else {
-                    let selected = self.selected_table.clone();
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("tables-panel-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        widgets::section_label(ui, "Tables");
+                        ui.add_space(4.0);
+                        if self.session.is_none() {
+                            widgets::empty_state(
+                                ui,
+                                "No database open",
+                                "Use File > Open database... or launch with --sample.",
+                            );
+                        } else if self.tables.is_empty() {
+                            widgets::empty_state(
+                                ui,
+                                "No tables",
+                                "Create a table to start entering records.",
+                            );
+                        } else {
+                            let selected = self.selected_table.clone();
                             for table in &self.tables {
                                 let is_selected = selected.as_deref() == Some(table.as_str());
                                 if ui.selectable_label(is_selected, table).clicked() {
                                     chosen = Some(table.clone());
                                 }
                             }
-                        });
-                    ui.separator();
-                    if ui.button("New table...").clicked() {
-                        create_table = true;
-                    }
-                }
-                ui.separator();
-                if ui.button("Open database...").clicked() {
-                    open_database = true;
-                }
-                if let Some(path) = self.host.document().database_path.clone() {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(path).size(10.0).color(theme::FAINT));
-                } else if self.session.is_some() {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("In-memory sample database")
-                            .size(10.0)
-                            .color(theme::FAINT),
-                    );
-                }
+                        }
+                        if self.session.is_some() {
+                            ui.separator();
+                            if ui.button("New table...").clicked() {
+                                create_table = true;
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Open database...").clicked() {
+                            open_database = true;
+                        }
+                        if let Some(path) = self.host.document().database_path.clone() {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(path).size(10.0).color(theme::FAINT));
+                        } else if self.session.is_some() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("In-memory sample database")
+                                    .size(10.0)
+                                    .color(theme::FAINT),
+                            );
+                        }
+                    });
             });
         if let Some(table) = chosen {
             self.select_table(table);
@@ -1196,210 +1272,362 @@ impl FormCraftApp {
             limit,
             error,
             session,
+            tables,
             ..
         } = self;
         let mut actions = CentralActions::default();
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Data");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::toolbar_button(ui, "Settings", "Preferences").clicked() {
-                        actions.settings = true;
-                    }
-                    if widgets::toolbar_button(ui, "Export CSV", "Export the current result")
-                        .clicked()
-                    {
-                        actions.export = true;
-                    }
-                    if widgets::toolbar_button(ui, "Import CSV", "Import into the selected table")
-                        .clicked()
-                    {
-                        actions.import = true;
-                    }
-                    if widgets::toolbar_button(ui, "Run", "Execute the SQL query (F5)").clicked() {
-                        actions.run = true;
-                    }
-                });
-            });
-            ui.add_space(6.0);
-
-            ui.label(RichText::new("SQL query").size(11.0).color(theme::MUTED));
-            let query = &mut host.history_mut().current_mut().last_query;
-            let response = ui.add(
-                egui::TextEdit::multiline(query)
-                    .hint_text("SELECT * FROM people;")
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            actions.gesture_gained |= response.gained_focus();
-            actions.gesture_lost |= response.lost_focus();
-
-            egui::CollapsingHeader::new("Recent queries")
-                .default_open(false)
+            egui::ScrollArea::vertical()
+                .id_salt("central-content-scroll")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let history = host.document().query_history.clone();
-                    if history.is_empty() {
-                        ui.label(RichText::new("No queries yet").color(theme::FAINT));
-                    }
-                    for query in history.iter().rev().take(12) {
-                        if ui.selectable_label(false, query).clicked() {
-                            actions.choose_query = Some(query.clone());
-                        }
-                    }
-                });
-
-            if let Some(message) = error {
-                ui.add_space(4.0);
-                ui.label(RichText::new(message.as_str()).color(Tone::Error.color()));
-            }
-            ui.add_space(4.0);
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.selectable_value(view, View::Grid, "Grid");
-                ui.selectable_value(view, View::Form, "Form");
-                if session.is_none() {
-                    return;
-                }
-                ui.add_space(8.0);
-                ui.label("Filter");
-                let response = ui.add(egui::TextEdit::singleline(search).desired_width(150.0));
-                actions.search_typed |= response.changed();
-                if ui.button("Refresh").clicked() {
-                    actions.refresh = true;
-                }
-                egui::ComboBox::from_label("Limit")
-                    .selected_text(limit.to_string())
-                    .show_ui(ui, |ui| {
-                        for candidate in [50_u32, 100, 200, 500] {
-                            ui.selectable_value(limit, candidate, candidate.to_string());
-                        }
-                    });
-            });
-
-            if session.is_none() {
-                widgets::empty_state(
-                    ui,
-                    "No database open",
-                    "Open a SQLite file or launch with --sample to browse data.",
-                );
-                return;
-            }
-
-            match *view {
-                View::Grid => {
                     ui.horizontal(|ui| {
-                        if ui.button("Add row").clicked() {
-                            actions.add_row = true;
-                        }
-                        ui.label(
-                            RichText::new(format!("{} row(s)", table_rows.result.row_count()))
-                                .color(theme::MUTED),
-                        );
+                        ui.heading("Data");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::toolbar_button(ui, "Settings", "Preferences").clicked() {
+                                actions.settings = true;
+                            }
+                            if widgets::toolbar_button(
+                                ui,
+                                "Export CSV",
+                                "Export the current result",
+                            )
+                            .clicked()
+                            {
+                                actions.export = true;
+                            }
+                            if widgets::toolbar_button(
+                                ui,
+                                "Import CSV",
+                                "Import into the selected table",
+                            )
+                            .clicked()
+                            {
+                                actions.import = true;
+                            }
+                            if widgets::toolbar_button(ui, "Run", "Execute the SQL query (F5)")
+                                .clicked()
+                            {
+                                actions.run = true;
+                            }
+                        });
                     });
+                    ui.add_space(6.0);
+
+                    ui.label(RichText::new("SQL query").size(11.0).color(theme::MUTED));
+                    let query = &mut host.history_mut().current_mut().last_query;
+                    let response = ui.add(
+                        egui::TextEdit::multiline(query)
+                            .hint_text("SELECT * FROM people;")
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    actions.gesture_gained |= response.gained_focus();
+                    actions.gesture_lost |= response.lost_focus();
+
+                    egui::CollapsingHeader::new("Recent queries")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let history = host.document().query_history.clone();
+                            if history.is_empty() {
+                                ui.label(RichText::new("No queries yet").color(theme::FAINT));
+                            }
+                            for query in history.iter().rev().take(12) {
+                                if ui.selectable_label(false, query).clicked() {
+                                    actions.choose_query = Some(query.clone());
+                                }
+                            }
+                        });
+
+                    if let Some(message) = error {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(message.as_str()).color(Tone::Error.color()));
+                    }
                     ui.add_space(4.0);
-                    if table_rows.result.columns.is_empty() {
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(view, View::Grid, "Grid");
+                        ui.selectable_value(view, View::Form, "Form");
+                        if session.is_none() {
+                            return;
+                        }
+                        ui.add_space(8.0);
+                        if table_rows.editable {
+                            ui.label("Filter");
+                            let response =
+                                ui.add(egui::TextEdit::singleline(search).desired_width(150.0));
+                            actions.search_typed |= response.changed();
+                            if ui.button("Refresh").clicked() {
+                                actions.refresh = true;
+                            }
+                            egui::ComboBox::from_label("Limit")
+                                .selected_text(limit.to_string())
+                                .show_ui(ui, |ui| {
+                                    for candidate in [50_u32, 100, 200, 500] {
+                                        ui.selectable_value(
+                                            limit,
+                                            candidate,
+                                            candidate.to_string(),
+                                        );
+                                    }
+                                });
+                        } else if tables.is_empty() {
+                            ui.label(RichText::new("No tables").color(theme::MUTED));
+                        } else {
+                            ui.label(RichText::new("Read-only query result").color(theme::MUTED));
+                        }
+                    });
+
+                    if session.is_none() {
                         widgets::empty_state(
                             ui,
-                            "No table selected",
-                            "Choose a table on the left.",
+                            "No database open",
+                            "Open a SQLite file or launch with --sample to browse data.",
                         );
-                    } else {
-                        egui::ScrollArea::both()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                egui::Grid::new("result-grid").striped(true).show(ui, |ui| {
-                                    ui.label("");
-                                    for column in &table_rows.result.columns {
-                                        ui.label(RichText::new(column).strong());
+                        return;
+                    }
+
+                    match *view {
+                        View::Grid => {
+                            let editable = table_rows.editable;
+                            ui.horizontal(|ui| {
+                                if editable {
+                                    if ui.button("Add row").clicked() {
+                                        actions.add_row = true;
                                     }
-                                    ui.end_row();
-                                    for (row_index, row) in
-                                        table_rows.result.rows.iter().enumerate()
-                                    {
-                                        let key = table_rows.row_ids.get(row_index).copied();
-                                        if ui.small_button("Form").clicked() {
-                                            actions.edit_row = key;
-                                        }
-                                        if ui.small_button("Del").clicked() {
-                                            actions.delete_row = key;
-                                        }
-                                        for (column_index, cell) in row.iter().enumerate() {
-                                            let is_editing = editing.as_ref().is_some_and(|edit| {
-                                                edit.row == row_index && edit.column == column_index
-                                            });
-                                            if is_editing {
-                                                if let Some(edit) = editing.as_mut() {
-                                                    let id = egui::Id::unique((
-                                                        "cell-edit",
-                                                        row_index,
-                                                        column_index,
-                                                    ));
-                                                    let response = ui.add(
-                                                        egui::TextEdit::singleline(&mut edit.text)
-                                                            .id(id)
-                                                            .desired_width(140.0),
+                                } else {
+                                    ui.label(RichText::new("Read-only result").color(theme::MUTED));
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} row(s)",
+                                        table_rows.result.row_count()
+                                    ))
+                                    .color(theme::MUTED),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            if table_rows.result.columns.is_empty() {
+                                if tables.is_empty() {
+                                    widgets::empty_state(
+                                        ui,
+                                        "No tables",
+                                        "Create a table from the Table menu or the left panel.",
+                                    );
+                                } else if error.is_some() {
+                                    widgets::empty_state(
+                                        ui,
+                                        "No result",
+                                        "Check the error above or choose a table on the left.",
+                                    );
+                                } else {
+                                    widgets::empty_state(
+                                        ui,
+                                        "No table selected",
+                                        "Choose a table on the left.",
+                                    );
+                                }
+                            } else {
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("result-grid-scroll")
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        egui::Grid::new("result-grid").striped(true).show(
+                                            ui,
+                                            |ui| {
+                                                if editable {
+                                                    ui.label(RichText::new("Form").strong());
+                                                    ui.label(RichText::new("Del").strong());
+                                                }
+                                                for column in &table_rows.result.columns {
+                                                    ui.label(RichText::new(column).strong());
+                                                }
+                                                ui.end_row();
+                                                if table_rows.result.rows.is_empty() {
+                                                    let message = if !editable {
+                                                        "No rows returned."
+                                                    } else if search.trim().is_empty() {
+                                                        "This table is empty."
+                                                    } else {
+                                                        "No rows match the current filter."
+                                                    };
+                                                    ui.label(
+                                                        RichText::new(message).color(theme::MUTED),
                                                     );
-                                                    if response.lost_focus()
-                                                        || ui.input(|input| {
-                                                            input.key_pressed(egui::Key::Enter)
-                                                        })
+                                                    ui.end_row();
+                                                }
+                                                for (row_index, row) in
+                                                    table_rows.result.rows.iter().enumerate()
+                                                {
+                                                    let key =
+                                                        table_rows.row_ids.get(row_index).copied();
+                                                    if editable {
+                                                        if ui
+                                                            .add_enabled(
+                                                                key.is_some(),
+                                                                egui::Button::new("Form").small(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            actions.edit_row = key;
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                key.is_some(),
+                                                                egui::Button::new("Del").small(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            actions.delete_row = key;
+                                                        }
+                                                    }
+                                                    for (column_index, cell) in
+                                                        row.iter().enumerate()
                                                     {
-                                                        actions.commit_edit = true;
+                                                        let column_name = table_rows
+                                                            .result
+                                                            .columns
+                                                            .get(column_index)
+                                                            .cloned()
+                                                            .unwrap_or_default();
+                                                        let is_editing = editable
+                                                            && editing.as_ref().is_some_and(
+                                                                |edit| {
+                                                                    key == Some(edit.row_id)
+                                                                        && edit.column
+                                                                            == column_name
+                                                                },
+                                                            );
+                                                        if is_editing {
+                                                            if let Some(edit) = editing.as_mut() {
+                                                                let id = egui::Id::unique((
+                                                                    "cell-edit",
+                                                                    edit.row_id,
+                                                                    column_name.as_str(),
+                                                                ));
+                                                                let response = ui.add(
+                                                                    egui::TextEdit::singleline(
+                                                                        &mut edit.text,
+                                                                    )
+                                                                    .id(id)
+                                                                    .desired_width(140.0),
+                                                                );
+                                                                if response.lost_focus()
+                                                                    || ui.input(|input| {
+                                                                        input.key_pressed(
+                                                                            egui::Key::Enter,
+                                                                        )
+                                                                    })
+                                                                {
+                                                                    actions.commit_edit = true;
+                                                                }
+                                                                if ui.input(|input| {
+                                                                    input.key_pressed(
+                                                                        egui::Key::Escape,
+                                                                    )
+                                                                }) {
+                                                                    actions.cancel_edit = true;
+                                                                }
+                                                            }
+                                                        } else {
+                                                            let response = ui.label(
+                                                                cell.as_deref().unwrap_or("NULL"),
+                                                            );
+                                                            if editable
+                                                                && let Some(row_id) = key
+                                                                && response.double_clicked()
+                                                            {
+                                                                actions.start_edit = Some((
+                                                                    row_id,
+                                                                    column_name,
+                                                                    cell.clone(),
+                                                                    cell.as_deref()
+                                                                        .unwrap_or("")
+                                                                        .to_owned(),
+                                                                ));
+                                                            }
+                                                        }
                                                     }
-                                                    if ui.input(|input| {
-                                                        input.key_pressed(egui::Key::Escape)
-                                                    }) {
-                                                        actions.cancel_edit = true;
-                                                    }
+                                                    ui.end_row();
                                                 }
-                                            } else {
-                                                let response =
-                                                    ui.label(cell.as_deref().unwrap_or("NULL"));
-                                                if response.double_clicked() {
-                                                    actions.start_edit = Some((
-                                                        row_index,
-                                                        column_index,
-                                                        cell.as_deref().unwrap_or("").to_owned(),
-                                                    ));
-                                                }
+                                            },
+                                        );
+                                    });
+                            }
+                        }
+                        View::Form => {
+                            ui.horizontal(|ui| {
+                                if form.editable {
+                                    if ui.button("New record").clicked() {
+                                        actions.new_form = true;
+                                    }
+                                    let save_label = if form.row_id.is_some() {
+                                        "Save changes"
+                                    } else {
+                                        "Create record"
+                                    };
+                                    if ui.button(save_label).clicked() {
+                                        actions.save_form = true;
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new("Read-only table (no accessible rowid)")
+                                            .color(theme::MUTED),
+                                    );
+                                }
+                            });
+                            ui.add_space(6.0);
+                            if form.is_empty() {
+                                widgets::empty_state(ui, "No fields", "Select a table first.");
+                            } else {
+                                egui::Grid::new("form-grid").striped(true).show(ui, |ui| {
+                                    for (index, column) in form.columns.iter().enumerate() {
+                                        let label = if column.not_null {
+                                            format!("{} *", column.name)
+                                        } else {
+                                            column.name.clone()
+                                        };
+                                        ui.label(RichText::new(label).strong());
+                                        if let Some(value) = form.values.get_mut(index) {
+                                            let response = ui.add_enabled(
+                                                form.editable,
+                                                egui::TextEdit::singleline(value)
+                                                    .desired_width(260.0),
+                                            );
+                                            if response.changed() {
+                                                actions.form_changed.push(index);
                                             }
+                                        }
+                                        ui.label(
+                                            RichText::new(column.sql_type.label())
+                                                .color(theme::FAINT),
+                                        );
+                                        if let Some(error) =
+                                            form.errors.iter().find(|error| error.index == index)
+                                        {
+                                            ui.label(
+                                                RichText::new(&error.message)
+                                                    .color(Tone::Error.color()),
+                                            );
                                         }
                                         ui.end_row();
                                     }
                                 });
-                            });
-                    }
-                }
-                View::Form => {
-                    ui.horizontal(|ui| {
-                        if ui.button("New record").clicked() {
-                            actions.new_form = true;
-                        }
-                        if ui.button("Create / Save").clicked() {
-                            actions.save_form = true;
-                        }
-                    });
-                    ui.add_space(6.0);
-                    if form.is_empty() {
-                        widgets::empty_state(ui, "No fields", "Select a table first.");
-                    } else {
-                        egui::Grid::new("form-grid").striped(true).show(ui, |ui| {
-                            for (index, column) in form.columns.iter().enumerate() {
-                                ui.label(&column.name);
-                                if let Some(value) = form.values.get_mut(index) {
-                                    ui.add(egui::TextEdit::singleline(value).desired_width(260.0));
+                                if form.editable {
+                                    ui.label(
+                                        RichText::new(
+                                            "* Required field; blank optional fields become NULL.",
+                                        )
+                                        .size(10.5)
+                                        .color(theme::FAINT),
+                                    );
                                 }
-                                ui.label(
-                                    RichText::new(column.sql_type.label()).color(theme::FAINT),
-                                );
-                                ui.end_row();
                             }
-                        });
+                        }
                     }
-                }
-            }
+                });
         });
 
         if actions.gesture_gained {
@@ -1408,11 +1636,15 @@ impl FormCraftApp {
         if actions.gesture_lost {
             self.finish_gesture();
         }
-        if let Some((row, column, text)) = actions.start_edit {
-            self.editing = Some(CellEdit { row, column, text });
-            ui.memory_mut(|memory| {
-                memory.request_focus(egui::Id::unique(("cell-edit", row, column)));
+        if let Some((row_id, column, before, text)) = actions.start_edit {
+            let id = egui::Id::unique(("cell-edit", row_id, column.as_str()));
+            self.editing = Some(CellEdit {
+                row_id,
+                column,
+                before,
+                text,
             });
+            ui.memory_mut(|memory| memory.request_focus(id));
         }
         if actions.commit_edit {
             self.commit_cell_edit();
@@ -1447,8 +1679,13 @@ impl FormCraftApp {
         if let Some(row_id) = actions.delete_row {
             self.request_delete_row(row_id);
         }
+        for index in actions.form_changed {
+            self.form.clear_error(index);
+        }
         if actions.new_form {
-            self.form = FormState::empty(self.form.columns.clone());
+            let mut state = FormState::empty(self.form.columns.clone());
+            state.editable = self.form.editable;
+            self.form = state;
         }
         if actions.save_form {
             self.save_form();
@@ -1470,7 +1707,7 @@ impl FormCraftApp {
             .show(ctx, |ui| {
                 match &confirmation {
                     Confirmation::DeleteRow { .. } => {
-                        ui.label("Delete this row? This cannot be undone from the project file.");
+                        ui.label("Delete this row? You can undo this during the current session.");
                     }
                     Confirmation::DropTable { table } => {
                         ui.label(format!(
@@ -1546,10 +1783,8 @@ impl FormCraftApp {
                     }
                 });
             });
-        if apply {
-            self.apply_schema_dialog(&dialog);
-            self.schema_dialog = None;
-        } else if cancel || !open {
+        let applied = apply && self.apply_schema_dialog(&dialog);
+        if applied || (!apply && (cancel || !open)) {
             self.schema_dialog = None;
         }
     }
@@ -1573,18 +1808,24 @@ impl FormCraftApp {
                 if columns.is_empty() {
                     ui.label("No table selected.");
                 }
-                for column in &columns {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&column.name).strong());
-                        ui.label(column.sql_type.label());
-                        if column.primary_key {
-                            ui.label(RichText::new("PK").color(theme::ACCENT));
-                        }
-                        if column.not_null {
-                            ui.label(RichText::new("NOT NULL").color(theme::WARNING));
+                egui::ScrollArea::vertical()
+                    .id_salt("schema-columns-scroll")
+                    .max_height(360.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for column in &columns {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&column.name).strong());
+                                ui.label(column.sql_type.label());
+                                if column.primary_key {
+                                    ui.label(RichText::new("PK").color(theme::ACCENT));
+                                }
+                                if column.not_null {
+                                    ui.label(RichText::new("NOT NULL").color(theme::WARNING));
+                                }
+                            });
                         }
                     });
-                }
             });
         if !open {
             self.show_schema = false;

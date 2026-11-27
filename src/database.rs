@@ -46,7 +46,11 @@ pub struct TableRows {
     /// Displayed columns and values.
     pub result: QueryResult,
     /// Stable edit key for each row, in the same order as `result.rows`.
+    ///
+    /// Empty for query results and tables without an accessible `rowid`.
     pub row_ids: Vec<i64>,
+    /// Whether controlled CRUD actions are available for this result.
+    pub editable: bool,
 }
 
 /// Errors produced by the database layer.
@@ -186,8 +190,21 @@ pub struct FormField {
     pub sql_type: SqlType,
     /// Whether this column is a primary key.
     pub primary_key: bool,
+    /// Whether SQLite requires a non-NULL value.
+    pub not_null: bool,
     /// Current field value as text.
     pub value: String,
+}
+
+/// A form validation problem associated with one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormFieldError {
+    /// Zero-based field index.
+    pub index: usize,
+    /// Column name.
+    pub column: String,
+    /// English message suitable for inline display.
+    pub message: String,
 }
 
 /// Parsed CSV input.
@@ -249,12 +266,46 @@ impl DataEdit {
             Self::Cell { column, .. } => format!("edit {column}"),
             Self::Insert { table, .. } => format!("insert into {table}"),
             Self::Delete { table, .. } => format!("delete from {table}"),
+            Self::Batch(edits) if edits.len() == 1 => "1 edit".to_owned(),
             Self::Batch(edits) => format!("{} edits", edits.len()),
         }
     }
 
-    /// Revert the edit.
+    /// Revert the edit atomically.
+    ///
+    /// A batch is one transaction, so a failure cannot leave earlier cells or
+    /// rows partially undone. The edit is restored to its previous in-memory
+    /// state when the transaction fails.
     pub fn undo(&mut self, connection: &mut Connection) -> Result<(), DbError> {
+        let previous = self.clone();
+        let result = (|| {
+            let transaction = connection.transaction()?;
+            self.undo_inner(&transaction)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            *self = previous;
+        }
+        result
+    }
+
+    /// Re-apply the edit atomically after an undo.
+    pub fn redo(&mut self, connection: &mut Connection) -> Result<(), DbError> {
+        let previous = self.clone();
+        let result = (|| {
+            let transaction = connection.transaction()?;
+            self.redo_inner(&transaction)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            *self = previous;
+        }
+        result
+    }
+
+    fn undo_inner(&mut self, connection: &Connection) -> Result<(), DbError> {
         match self {
             Self::Cell {
                 table,
@@ -262,28 +313,27 @@ impl DataEdit {
                 column,
                 before,
                 ..
-            } => update_cell(connection, table, *row_id, column, before.as_deref()),
-            Self::Insert { table, row_id, .. } => delete_row(connection, table, *row_id),
+            } => update_cell_inner(connection, table, *row_id, column, before.as_deref()),
+            Self::Insert { table, row_id, .. } => delete_row_inner(connection, table, *row_id),
             Self::Delete {
                 table,
                 columns,
                 values,
                 row_id,
             } => {
-                *row_id = insert_record(connection, table, columns, values)?;
+                *row_id = insert_record_inner(connection, table, columns, values)?;
                 Ok(())
             }
             Self::Batch(edits) => {
                 for edit in edits.iter_mut().rev() {
-                    edit.undo(connection)?;
+                    edit.undo_inner(connection)?;
                 }
                 Ok(())
             }
         }
     }
 
-    /// Re-apply the edit after an undo.
-    pub fn redo(&mut self, connection: &mut Connection) -> Result<(), DbError> {
+    fn redo_inner(&mut self, connection: &Connection) -> Result<(), DbError> {
         match self {
             Self::Cell {
                 table,
@@ -291,20 +341,20 @@ impl DataEdit {
                 column,
                 after,
                 ..
-            } => update_cell(connection, table, *row_id, column, after.as_deref()),
+            } => update_cell_inner(connection, table, *row_id, column, after.as_deref()),
             Self::Insert {
                 table,
                 columns,
                 values,
                 row_id,
             } => {
-                *row_id = insert_record(connection, table, columns, values)?;
+                *row_id = insert_record_inner(connection, table, columns, values)?;
                 Ok(())
             }
-            Self::Delete { table, row_id, .. } => delete_row(connection, table, *row_id),
+            Self::Delete { table, row_id, .. } => delete_row_inner(connection, table, *row_id),
             Self::Batch(edits) => {
                 for edit in edits.iter_mut() {
-                    edit.redo(connection)?;
+                    edit.redo_inner(connection)?;
                 }
                 Ok(())
             }
@@ -506,7 +556,9 @@ pub fn drop_table(connection: &Connection, table: &str) -> Result<(), DbError> {
 
 /// Read a table with its `rowid`, applying an optional case-insensitive filter.
 ///
-/// The limit is bounded by the caller and passed as a bound SQL parameter.
+/// Tables without an accessible `rowid` (including `WITHOUT ROWID` tables) are
+/// still browsable, but [`TableRows::editable`] is false. The limit is bounded
+/// by the caller and passed as a bound SQL parameter.
 pub fn table_rows(
     connection: &Connection,
     table: &str,
@@ -514,6 +566,7 @@ pub fn table_rows(
     limit: u32,
 ) -> Result<TableRows, DbError> {
     let columns = table_schema(connection, table)?;
+    let rowid = table_rowid_keyword(connection, table)?;
     let mut values: Vec<String> = Vec::new();
     let mut conditions = Vec::new();
     if let Some(needle) = search.map(str::trim).filter(|value| !value.is_empty()) {
@@ -533,8 +586,9 @@ pub fn table_rows(
         format!(" WHERE {}", conditions.join(" OR "))
     };
     values.push(limit.max(1).to_string());
+    let projection = rowid.map_or_else(String::new, |keyword| format!("{keyword}, "));
     let sql = format!(
-        "SELECT rowid, * FROM {}{} LIMIT ?{}",
+        "SELECT {projection}* FROM {}{} LIMIT ?{}",
         quote_identifier(table),
         where_clause,
         values.len()
@@ -545,33 +599,85 @@ pub fn table_rows(
         .column_names()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let offset = usize::from(rowid.is_some());
     let mut cursor = statement.query(params_from_iter(values.iter().map(String::as_str)))?;
     let mut result = QueryResult::default();
     let mut row_ids = Vec::new();
     while let Some(row) = cursor.next()? {
-        row_ids.push(row.get::<_, i64>(0)?);
-        let mut cells = Vec::with_capacity(names.len().saturating_sub(1));
-        for index in 1..names.len() {
+        if rowid.is_some() {
+            row_ids.push(row.get::<_, i64>(0)?);
+        }
+        let mut cells = Vec::with_capacity(names.len().saturating_sub(offset));
+        for index in offset..names.len() {
             cells.push(cell_text(row.get_ref(index)?));
         }
         result.rows.push(cells);
     }
-    if let Some(visible) = names.get(1..) {
+    if let Some(visible) = names.get(offset..) {
         result.columns = visible.to_vec();
     }
-    Ok(TableRows { result, row_ids })
+    Ok(TableRows {
+        result,
+        row_ids,
+        editable: rowid.is_some(),
+    })
+}
+
+/// Whether a table has an unambiguous SQLite `rowid` for controlled CRUD.
+pub fn table_has_rowid(connection: &Connection, table: &str) -> Result<bool, DbError> {
+    Ok(table_rowid_keyword(connection, table)?.is_some())
+}
+
+fn table_rowid_keyword(
+    connection: &Connection,
+    table: &str,
+) -> Result<Option<&'static str>, DbError> {
+    let mut statement = connection
+        .prepare("SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1")?;
+    let without_rowid = statement.query_row([table], |row| row.get::<_, i64>(0))?;
+    if without_rowid != 0 {
+        return Ok(None);
+    }
+
+    let mut statement = connection.prepare("SELECT name FROM pragma_table_xinfo(?1)")?;
+    let names = statement.query_map([table], |row| row.get::<_, String>(0))?;
+    let mut shadowed = HashSet::new();
+    for name in names {
+        shadowed.insert(name?.to_ascii_lowercase());
+    }
+    Ok(["rowid", "_rowid_", "oid"]
+        .into_iter()
+        .find(|candidate| !shadowed.contains(*candidate)))
 }
 
 /// Run a read-only SQL query and collect its result.
 ///
-/// Destructive statements are rejected before reaching SQLite so that the
-/// query box cannot modify the opened database by accident.
+/// The keyword guard rejects obvious writes. SQLite's `query_only` mode is
+/// also enabled while the statement runs, because `WITH` can prefix a write
+/// and some PRAGMAs mutate database state. The caller's previous mode is
+/// restored even when parsing or execution fails.
 pub fn run_query(connection: &Connection, sql: &str) -> Result<QueryResult, DbError> {
     if !is_read_only(sql) {
         return Err(DbError::NotAQuery);
     }
-    let mut statement = connection.prepare(sql)?;
-    collect_rows(&mut statement, [])
+    let was_query_only: bool =
+        connection.query_row("PRAGMA query_only", [], |row| row.get::<_, bool>(0))?;
+    connection.pragma_update(None, "query_only", true)?;
+    let result: Result<QueryResult, DbError> = (|| {
+        let mut statement = connection.prepare(sql)?;
+        collect_rows(&mut statement, [])
+    })();
+    let restored = connection.pragma_update(None, "query_only", was_query_only);
+    match result {
+        Ok(result) => {
+            restored?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = restored;
+            Err(error)
+        }
+    }
 }
 
 /// Return the values of one row, or `None` when it no longer exists.
@@ -580,7 +686,11 @@ pub fn record_values(
     table: &str,
     row_id: i64,
 ) -> Result<Option<Vec<Option<String>>>, DbError> {
-    let sql = format!("SELECT * FROM {} WHERE rowid = ?1", quote_identifier(table));
+    let rowid = editable_rowid(connection, table)?;
+    let sql = format!(
+        "SELECT * FROM {} WHERE {rowid} = ?1",
+        quote_identifier(table)
+    );
     let mut statement = connection.prepare(&sql)?;
     let width = statement.column_count();
     let mut cursor = statement.query(params![row_id])?;
@@ -602,23 +712,56 @@ pub fn update_cell(
     column: &str,
     value: Option<&str>,
 ) -> Result<(), DbError> {
+    let transaction = connection.transaction()?;
+    update_cell_inner(&transaction, table, row_id, column, value)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn update_cell_inner(
+    connection: &Connection,
+    table: &str,
+    row_id: i64,
+    column: &str,
+    value: Option<&str>,
+) -> Result<(), DbError> {
     if !is_valid_identifier(column) {
         return Err(DbError::InvalidName(column.to_owned()));
     }
+    let rowid = editable_rowid(connection, table)?;
+    let schema = table_schema(connection, table)?;
+    let definition = schema
+        .iter()
+        .find(|definition| definition.name.eq_ignore_ascii_case(column))
+        .ok_or_else(|| DbError::InvalidDefinition(format!("unknown column '{column}'")))?;
+    let bound = coerce_value(value, definition.sql_type)?;
     let sql = format!(
-        "UPDATE {} SET {} = ?1 WHERE rowid = ?2",
+        "UPDATE {} SET {} = ?1 WHERE {rowid} = ?2",
         quote_identifier(table),
         quote_identifier(column)
     );
-    let transaction = connection.transaction()?;
-    transaction.execute(&sql, params![value, row_id])?;
-    transaction.commit()?;
+    let changed = connection.execute(&sql, params![bound, row_id])?;
+    if changed != 1 {
+        return Err(DbError::Invalid("the row no longer exists".into()));
+    }
     Ok(())
 }
 
 /// Insert a row whose values follow `table_schema` order.
 pub fn insert_record(
     connection: &mut Connection,
+    table: &str,
+    columns: &[String],
+    values: &[Option<String>],
+) -> Result<i64, DbError> {
+    let transaction = connection.transaction()?;
+    let row_id = insert_record_inner(&transaction, table, columns, values)?;
+    transaction.commit()?;
+    Ok(row_id)
+}
+
+fn insert_record_inner(
+    connection: &Connection,
     table: &str,
     columns: &[String],
     values: &[Option<String>],
@@ -630,6 +773,7 @@ pub fn insert_record(
             values.len()
         )));
     }
+    let schema = table_schema(connection, table)?;
     let names = columns
         .iter()
         .map(|name| quote_identifier(name))
@@ -645,24 +789,33 @@ pub fn insert_record(
         names,
         placeholders
     );
-    let bound: Vec<Value> = values
-        .iter()
-        .map(|value| {
-            value
-                .as_deref()
-                .map_or(Value::Null, |text| Value::Text(text.to_owned()))
-        })
-        .collect();
-    let transaction = connection.transaction()?;
-    transaction.execute(&sql, params_from_iter(bound))?;
-    let row_id = transaction.last_insert_rowid();
-    transaction.commit()?;
-    Ok(row_id)
+    let mut bound = Vec::with_capacity(values.len());
+    for (column, value) in columns.iter().zip(values) {
+        let definition = schema
+            .iter()
+            .find(|definition| definition.name == *column)
+            .ok_or_else(|| DbError::InvalidDefinition(format!("unknown column '{column}'")))?;
+        bound.push(coerce_value(value.as_deref(), definition.sql_type)?);
+    }
+    connection.execute(&sql, params_from_iter(bound))?;
+    Ok(connection.last_insert_rowid())
 }
 
 /// Update every column of one row in one transaction.
 pub fn update_record(
     connection: &mut Connection,
+    table: &str,
+    row_id: i64,
+    values: &[Option<String>],
+) -> Result<(), DbError> {
+    let transaction = connection.transaction()?;
+    update_record_inner(&transaction, table, row_id, values)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn update_record_inner(
+    connection: &Connection,
     table: &str,
     row_id: i64,
     values: &[Option<String>],
@@ -676,6 +829,7 @@ pub fn update_record(
             values.len()
         )));
     }
+    let rowid = editable_rowid(connection, table)?;
     let assignments = columns
         .iter()
         .enumerate()
@@ -683,33 +837,48 @@ pub fn update_record(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "UPDATE {} SET {} WHERE rowid = ?{}",
+        "UPDATE {} SET {} WHERE {rowid} = ?{}",
         quote_identifier(table),
         assignments,
         columns.len() + 1
     );
-    let mut bound: Vec<Value> = values
+    let mut bound: Vec<Value> = columns
         .iter()
-        .map(|value| {
-            value
-                .as_deref()
-                .map_or(Value::Null, |text| Value::Text(text.to_owned()))
-        })
-        .collect();
+        .zip(values)
+        .map(|(column, value)| coerce_value(value.as_deref(), column.sql_type))
+        .collect::<Result<_, _>>()?;
     bound.push(Value::Integer(row_id));
-    let transaction = connection.transaction()?;
-    transaction.execute(&sql, params_from_iter(bound))?;
-    transaction.commit()?;
+    let changed = connection.execute(&sql, params_from_iter(bound))?;
+    if changed != 1 {
+        return Err(DbError::Invalid("the row no longer exists".into()));
+    }
     Ok(())
 }
 
 /// Delete one row by `rowid` in one transaction.
 pub fn delete_row(connection: &mut Connection, table: &str, row_id: i64) -> Result<(), DbError> {
-    let sql = format!("DELETE FROM {} WHERE rowid = ?1", quote_identifier(table));
     let transaction = connection.transaction()?;
-    transaction.execute(&sql, params![row_id])?;
+    delete_row_inner(&transaction, table, row_id)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn delete_row_inner(connection: &Connection, table: &str, row_id: i64) -> Result<(), DbError> {
+    let rowid = editable_rowid(connection, table)?;
+    let sql = format!("DELETE FROM {} WHERE {rowid} = ?1", quote_identifier(table));
+    let changed = connection.execute(&sql, params![row_id])?;
+    if changed != 1 {
+        return Err(DbError::Invalid("the row no longer exists".into()));
+    }
+    Ok(())
+}
+
+fn editable_rowid(connection: &Connection, table: &str) -> Result<&'static str, DbError> {
+    table_rowid_keyword(connection, table)?.ok_or_else(|| {
+        DbError::Invalid(format!(
+            "table '{table}' does not have an accessible rowid; browse it without editing"
+        ))
+    })
 }
 
 /// Build form fields from a table schema and, optionally, an existing row.
@@ -725,10 +894,39 @@ pub fn build_form_fields(
             name: column.name.clone(),
             sql_type: column.sql_type,
             primary_key: column.primary_key,
+            not_null: column.not_null,
             value: values
                 .and_then(|row| row.get(index))
                 .and_then(Option::clone)
                 .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Validate generated form fields without touching the database.
+///
+/// Blank optional fields become SQL `NULL`. Required fields, integer syntax
+/// and finite real numbers are checked before any write is attempted.
+#[must_use]
+pub fn validate_form_fields(fields: &[FormField]) -> Vec<FormFieldError> {
+    fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            if field.value.trim().is_empty() {
+                return field.not_null.then(|| FormFieldError {
+                    index,
+                    column: field.name.clone(),
+                    message: "This field is required.".into(),
+                });
+            }
+            coerce_value(Some(&field.value), field.sql_type)
+                .err()
+                .map(|error| FormFieldError {
+                    index,
+                    column: field.name.clone(),
+                    message: error.to_string(),
+                })
         })
         .collect()
 }
@@ -744,8 +942,10 @@ pub fn coerce_value(value: Option<&str>, sql_type: SqlType) -> Result<Value, DbE
                 .map_err(|_| DbError::Invalid(format!("'{text}' is not an integer"))),
             SqlType::Real => text
                 .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite())
                 .map(Value::Real)
-                .map_err(|_| DbError::Invalid(format!("'{text}' is not a number"))),
+                .ok_or_else(|| DbError::Invalid(format!("'{text}' is not a finite number"))),
             SqlType::Text => Ok(Value::Text(text.to_owned())),
         },
     }
@@ -771,7 +971,7 @@ pub fn parse_csv(input: &str, has_headers: bool) -> Result<CsvImport, DbError> {
         )));
     }
     let to_strings = |record: &StringRecord| record.iter().map(str::to_owned).collect::<Vec<_>>();
-    let (headers, rows) = if has_headers {
+    let (mut headers, rows) = if has_headers {
         (
             to_strings(first),
             records.iter().skip(1).map(to_strings).collect::<Vec<_>>(),
@@ -782,6 +982,12 @@ pub fn parse_csv(input: &str, has_headers: bool) -> Result<CsvImport, DbError> {
             records.iter().map(to_strings).collect::<Vec<_>>(),
         )
     };
+    if let Some(first_header) = headers.first_mut() {
+        *first_header = first_header
+            .strip_prefix('\u{feff}')
+            .unwrap_or(first_header)
+            .to_owned();
+    }
     Ok(CsvImport { headers, rows })
 }
 
@@ -809,9 +1015,17 @@ pub fn import_csv(
         }
         (0..columns.len()).collect()
     } else {
+        let mut seen = HashSet::new();
         data.headers
             .iter()
             .map(|header| {
+                let normalized = header.to_ascii_lowercase();
+                if header.trim().is_empty() {
+                    return Err(DbError::Csv("header names cannot be empty".into()));
+                }
+                if !seen.insert(normalized) {
+                    return Err(DbError::Csv(format!("duplicate header '{header}'")));
+                }
                 columns
                     .iter()
                     .position(|column| column.name.eq_ignore_ascii_case(header))
@@ -848,20 +1062,25 @@ pub fn import_csv(
     );
 
     let transaction = connection.transaction()?;
+    let first_data_line = if data.headers.is_empty() { 1 } else { 2 };
     for (row_number, row) in data.rows.iter().enumerate() {
+        let line_number = row_number + first_data_line;
         let mut bound = vec![Value::Null; columns.len()];
         for (field_index, text) in row.iter().enumerate() {
             let column_index = mapping[field_index];
             bound[column_index] = coerce_value(Some(text), columns[column_index].sql_type)
                 .map_err(|error| {
                     DbError::Csv(format!(
-                        "row {}, column '{}': {error}",
-                        row_number + 1,
+                        "row {line_number}, column '{}': {error}",
                         columns[column_index].name
                     ))
                 })?;
         }
-        transaction.execute(&sql, params_from_iter(bound))?;
+        transaction
+            .execute(&sql, params_from_iter(bound))
+            .map_err(|error| {
+                DbError::Csv(format!("row {line_number} in table '{table}': {error}"))
+            })?;
     }
     transaction.commit()?;
     Ok(data.rows.len())
@@ -1006,6 +1225,41 @@ mod tests {
             ("name".to_owned(), SqlType::Text),
             ("email".to_owned(), SqlType::Text),
         ]
+    }
+
+    #[test]
+    fn sample_query_schema_and_rows_are_consistent() {
+        let document = crate::document::Document::sample();
+        let connection = create_memory_database().expect("sample database");
+        let schema = table_schema(&connection, "people").expect("sample schema");
+        let names = schema
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["id", "name", "email"]);
+        let result = run_query(&connection, &document.last_query).expect("sample query");
+        assert_eq!(result.columns, names);
+        assert_eq!(result.row_count(), 3);
+        let rows = table_rows(&connection, "people", None, 100).expect("sample rows");
+        assert!(rows.editable);
+        assert_eq!(rows.row_ids.len(), result.row_count());
+        assert!(rows.result.rows.iter().all(|row| row.len() == schema.len()));
+    }
+
+    #[test]
+    fn empty_tables_keep_their_schema_and_editability() {
+        let connection = memory();
+        create_table(&connection, "people", &people_columns()).expect("create table");
+        let rows = table_rows(&connection, "people", None, 100).expect("empty rows");
+        assert!(rows.editable);
+        assert!(rows.result.is_empty());
+        assert!(rows.row_ids.is_empty());
+        assert_eq!(rows.result.columns, vec!["id", "name", "email"]);
+        assert_eq!(
+            build_form_fields(&table_schema(&connection, "people").expect("schema"), None).len(),
+            3
+        );
+        assert_eq!(export_csv(&rows.result), "id,name,email\n");
     }
 
     #[test]
@@ -1219,7 +1473,7 @@ mod tests {
                 .as_deref(),
             Some("Ada")
         );
-        assert_eq!(batch.label(), "1 edits");
+        assert_eq!(batch.label(), "1 edit");
     }
 
     #[test]
@@ -1271,6 +1525,30 @@ mod tests {
         );
         assert!(coerce_value(Some("nope"), SqlType::Integer).is_err());
         assert!(coerce_value(Some("nope"), SqlType::Real).is_err());
+    }
+
+    #[test]
+    fn grid_updates_use_the_declared_column_type() {
+        let mut connection = memory();
+        create_table(
+            &connection,
+            "scores",
+            &[("points".to_owned(), SqlType::Integer)],
+        )
+        .expect("create table");
+        let names = vec!["points".to_owned()];
+        let row_id =
+            insert_record(&mut connection, "scores", &names, &[Some("10".into())]).expect("insert");
+        assert!(update_cell(&mut connection, "scores", row_id, "points", Some("nope")).is_err());
+        update_cell(&mut connection, "scores", row_id, "points", Some("12")).expect("typed update");
+        let storage = connection
+            .query_row(
+                "SELECT typeof(points) FROM scores WHERE rowid = ?1",
+                [row_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("storage type");
+        assert_eq!(storage, "integer");
     }
 
     #[test]
@@ -1328,6 +1606,289 @@ mod tests {
             2
         );
         assert!(parse_csv("", false).is_err());
+    }
+
+    #[test]
+    fn read_only_guard_blocks_writable_ctes_and_pragmas() {
+        let connection = create_memory_database().expect("sample database");
+        assert!(
+            run_query(
+                &connection,
+                "WITH changed AS (SELECT 1) DELETE FROM people WHERE id = 1"
+            )
+            .is_err()
+        );
+        assert!(run_query(&connection, "PRAGMA user_version = 42").is_err());
+        assert!(
+            run_query(
+                &connection,
+                "WITH changed AS (SELECT 1) INSERT INTO people (name, email) SELECT 'Blocked', NULL"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            run_query(&connection, "SELECT COUNT(*) AS count FROM people")
+                .expect("count")
+                .rows,
+            vec![vec![Some("3".into())]]
+        );
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("user version");
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn batch_redo_rolls_back_earlier_cells_on_failure() {
+        let mut connection = memory();
+        create_table(&connection, "people", &people_columns()).expect("create table");
+        let names = vec!["id".to_owned(), "name".to_owned(), "email".to_owned()];
+        insert_record(
+            &mut connection,
+            "people",
+            &names,
+            &[None, Some("Ada".into()), None],
+        )
+        .expect("insert");
+        let mut batch = DataEdit::Batch(vec![
+            DataEdit::Cell {
+                table: "people".into(),
+                row_id: 1,
+                column: "name".into(),
+                before: Some("Ada".into()),
+                after: Some("Ada Lovelace".into()),
+            },
+            DataEdit::Cell {
+                table: "people".into(),
+                row_id: 1,
+                column: "missing".into(),
+                before: None,
+                after: Some("invalid".into()),
+            },
+        ]);
+        assert!(batch.redo(&mut connection).is_err());
+        assert_eq!(
+            record_values(&connection, "people", 1)
+                .expect("row")
+                .expect("existing")[1]
+                .as_deref(),
+            Some("Ada")
+        );
+    }
+
+    #[test]
+    fn csv_import_rejects_duplicate_headers_and_rolls_back_late_errors() {
+        let mut connection = memory();
+        create_table(
+            &connection,
+            "scores",
+            &[
+                ("label".to_owned(), SqlType::Text),
+                ("points".to_owned(), SqlType::Integer),
+            ],
+        )
+        .expect("create table");
+        let duplicate = parse_csv("label,LABEL\nA,10\n", true).expect("parse csv");
+        assert!(import_csv(&mut connection, "scores", &duplicate).is_err());
+
+        let late_error = parse_csv("label,points\nA,10\nB,nope\n", true).expect("parse csv");
+        assert!(import_csv(&mut connection, "scores", &late_error).is_err());
+        assert!(
+            table_rows(&connection, "scores", None, 100)
+                .expect("grid")
+                .result
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn batch_undo_restores_database_and_edit_state_on_failure() {
+        let mut connection = memory();
+        create_table(&connection, "people", &people_columns()).expect("create table");
+        let names = vec!["id".to_owned(), "name".to_owned(), "email".to_owned()];
+        insert_record(
+            &mut connection,
+            "people",
+            &names,
+            &[None, Some("Ada".into()), None],
+        )
+        .expect("insert");
+        let mut batch = DataEdit::Batch(vec![
+            DataEdit::Cell {
+                table: "people".into(),
+                row_id: 1,
+                column: "name".into(),
+                before: Some("Ada".into()),
+                after: Some("Ada Lovelace".into()),
+            },
+            DataEdit::Cell {
+                table: "people".into(),
+                row_id: 1,
+                column: "email".into(),
+                before: None,
+                after: Some("ada@example.com".into()),
+            },
+        ]);
+        batch.redo(&mut connection).expect("apply batch");
+        let DataEdit::Batch(edits) = &mut batch else {
+            panic!("batch expected");
+        };
+        let DataEdit::Cell { column, .. } = &mut edits[1] else {
+            panic!("cell expected");
+        };
+        column.clear();
+        let previous = batch.clone();
+        assert!(batch.undo(&mut connection).is_err());
+        assert_eq!(batch, previous);
+        let values = record_values(&connection, "people", 1)
+            .expect("row")
+            .expect("existing");
+        assert_eq!(values[1].as_deref(), Some("Ada Lovelace"));
+        assert_eq!(values[2].as_deref(), Some("ada@example.com"));
+    }
+
+    #[test]
+    fn browses_without_rowid_tables_and_uses_unshadowed_rowid_aliases() {
+        let mut connection = memory();
+        connection
+            .execute_batch(
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY, name TEXT) WITHOUT ROWID;\
+                 INSERT INTO entries VALUES (1, 'Ada');",
+            )
+            .expect("create without rowid table");
+        let browsed = table_rows(&connection, "entries", None, 100).expect("browse");
+        assert!(!browsed.editable);
+        assert!(browsed.row_ids.is_empty());
+        assert_eq!(
+            browsed.result.rows,
+            vec![vec![Some("1".into()), Some("Ada".into())]]
+        );
+        assert!(!table_has_rowid(&connection, "entries").expect("rowid check"));
+        assert!(update_cell(&mut connection, "entries", 1, "name", Some("Grace")).is_err());
+
+        connection
+            .execute_batch(
+                "CREATE TABLE shadowed (rowid TEXT, name TEXT);\
+                 INSERT INTO shadowed VALUES ('external', 'Ada');",
+            )
+            .expect("create shadowed table");
+        let rows = table_rows(&connection, "shadowed", None, 100).expect("shadowed rows");
+        assert!(rows.editable);
+        assert_eq!(rows.row_ids, vec![1]);
+        assert_eq!(rows.result.columns, vec!["rowid", "name"]);
+        update_cell(&mut connection, "shadowed", 1, "name", Some("Grace"))
+            .expect("update by hidden rowid");
+        assert_eq!(
+            record_values(&connection, "shadowed", 1)
+                .expect("row")
+                .expect("existing")[1]
+                .as_deref(),
+            Some("Grace")
+        );
+    }
+
+    #[test]
+    fn validates_required_and_typed_form_fields() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".into(),
+                sql_type: SqlType::Integer,
+                not_null: false,
+                primary_key: true,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                sql_type: SqlType::Text,
+                not_null: true,
+                primary_key: false,
+            },
+            ColumnInfo {
+                name: "score".into(),
+                sql_type: SqlType::Real,
+                not_null: false,
+                primary_key: false,
+            },
+        ];
+        let mut fields = build_form_fields(&columns, None);
+        fields[2].value = "NaN".into();
+        let errors = validate_form_fields(&fields);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].index, 1);
+        assert!(errors[0].message.contains("required"));
+        assert!(errors[1].message.contains("finite"));
+
+        fields[1].value = "Ada".into();
+        fields[2].value = "2.5".into();
+        assert!(validate_form_fields(&fields).is_empty());
+        fields[2].value = "inf".into();
+        assert!(
+            validate_form_fields(&fields)
+                .iter()
+                .any(|error| error.index == 2)
+        );
+    }
+
+    #[test]
+    fn csv_handles_bom_reordered_headers_nulls_and_quoted_newlines() {
+        let mut connection = memory();
+        create_table(
+            &connection,
+            "scores",
+            &[
+                ("label".to_owned(), SqlType::Text),
+                ("points".to_owned(), SqlType::Integer),
+            ],
+        )
+        .expect("create table");
+        let data =
+            parse_csv("\u{feff}Points,Label\n10,\"Ada\nLovelace\"\n,\n", true).expect("parse csv");
+        assert_eq!(data.headers, vec!["Points", "Label"]);
+        assert_eq!(
+            import_csv(&mut connection, "scores", &data).expect("import"),
+            2
+        );
+        let rows = table_rows(&connection, "scores", None, 100).expect("rows");
+        assert_eq!(rows.result.rows[0][0].as_deref(), Some("Ada\nLovelace"));
+        assert_eq!(rows.result.rows[0][1].as_deref(), Some("10"));
+        assert_eq!(rows.result.rows[1], vec![None, None]);
+
+        let exported = export_csv(&rows.result);
+        let reparsed = parse_csv(&exported, true).expect("reparse export");
+        assert_eq!(
+            reparsed.rows,
+            vec![
+                vec!["Ada\nLovelace".into(), "10".into()],
+                vec![String::new(), String::new()],
+            ]
+        );
+    }
+
+    #[test]
+    fn read_only_queries_restore_the_connections_previous_mode() {
+        let connection = create_memory_database().expect("sample database");
+        connection
+            .pragma_update(None, "query_only", true)
+            .expect("enable query only");
+        assert!(run_query(&connection, "SELECT 1").is_ok());
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO people (name, email) VALUES ('Blocked', NULL)",
+                    []
+                )
+                .is_err()
+        );
+        connection
+            .pragma_update(None, "query_only", false)
+            .expect("disable query only");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO people (name, email) VALUES ('Allowed', NULL)",
+                    []
+                )
+                .is_ok()
+        );
     }
 
     #[test]
